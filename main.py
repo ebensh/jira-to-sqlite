@@ -6,6 +6,7 @@ Jira to SQLite - Fetch Jira project issues and store them in SQLite database.
 import sqlite3
 import os
 import sys
+import argparse
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from jira import JIRA
@@ -32,9 +33,10 @@ class JiraToSQLite:
     def connect_to_jira(self) -> bool:
         """Connect to Jira using credentials."""
         try:
+            # Use bearer token authentication for API tokens
             self.jira = JIRA(
                 server=self.server_url,
-                basic_auth=(self.username, self.api_token)
+                token_auth=self.api_token
             )
             print(f"Successfully connected to Jira: {self.server_url}")
             return True
@@ -65,12 +67,13 @@ class JiraToSQLite:
         self.conn.commit()
         print(f"Database schema created at: {self.db_path}")
 
-    def fetch_project_issues(self, project_key: str) -> List[Dict[str, Any]]:
+    def fetch_project_issues(self, project_key: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
-        Fetch all issues from a Jira project.
+        Fetch issues from a Jira project.
         
         Args:
             project_key: Jira project key (e.g., 'PROJ')
+            limit: Maximum number of issues to fetch (None for all issues)
             
         Returns:
             List of issue dictionaries
@@ -82,14 +85,25 @@ class JiraToSQLite:
         start_at = 0
         max_results = 50
         
-        print(f"Fetching issues from project: {project_key}")
+        if limit:
+            print(f"Fetching up to {limit} recent issues from project: {project_key}")
+        else:
+            print(f"Fetching all issues from project: {project_key}")
         
         while True:
             try:
+                # Adjust max_results if we're near the limit
+                current_max_results = max_results
+                if limit and (start_at + max_results > limit):
+                    current_max_results = limit - start_at
+                
+                # Order by created date descending to get most recent issues first
+                jql_query = f'project = {project_key} ORDER BY created DESC'
+                
                 issues = self.jira.search_issues(
-                    f'project = {project_key}',
+                    jql_query,
                     startAt=start_at,
-                    maxResults=max_results,
+                    maxResults=current_max_results,
                     expand='renderedFields'
                 )
                 
@@ -111,10 +125,13 @@ class JiraToSQLite:
                 
                 print(f"Fetched {len(issues)} issues (total: {len(issues_data)})")
                 
-                if len(issues) < max_results:
+                # Break if we've reached the limit or no more issues
+                if limit and len(issues_data) >= limit:
+                    break
+                if len(issues) < current_max_results:
                     break
                     
-                start_at += max_results
+                start_at += current_max_results
                 
             except Exception as e:
                 print(f"Error fetching issues: {e}")
@@ -158,19 +175,20 @@ class JiraToSQLite:
             self.conn.close()
             print("Database connection closed")
 
-    def run(self, project_key: str):
+    def run(self, project_key: str, limit: Optional[int] = None):
         """
         Main execution method to fetch Jira issues and store them in SQLite.
         
         Args:
             project_key: Jira project key to fetch issues from
+            limit: Maximum number of issues to fetch (None for all issues)
         """
         try:
             if not self.connect_to_jira():
                 return False
             
             self.create_database_schema()
-            issues = self.fetch_project_issues(project_key)
+            issues = self.fetch_project_issues(project_key, limit)
             
             if issues:
                 self.store_issues_to_db(issues)
@@ -189,23 +207,45 @@ class JiraToSQLite:
 
 def main():
     """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Fetch Jira project issues and store them in SQLite database"
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Maximum number of issues to fetch (fetches most recent issues first). Default: fetch all issues"
+    )
+    parser.add_argument(
+        "--project",
+        type=str,
+        help="Jira project key to fetch (overrides JIRA_PROJECT_KEY env var)"
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default="jira_issues.db",
+        help="Path to SQLite database file (default: jira_issues.db)"
+    )
+    
+    args = parser.parse_args()
+    
     # Get configuration from environment variables
     server_url = os.getenv('JIRA_SERVER_URL')
     username = os.getenv('JIRA_USERNAME')
     api_token = os.getenv('JIRA_API_TOKEN')
-    project_key = os.getenv('JIRA_PROJECT_KEY')
+    project_key = args.project or os.getenv('JIRA_PROJECT_KEY')
     
-    if not all([server_url, username, api_token, project_key]):
-        print("Error: Missing required environment variables:")
+    if not all([server_url, api_token, project_key]):
+        print("Error: Missing required configuration:")
         print("- JIRA_SERVER_URL: Your Jira server URL (e.g., https://company.atlassian.net)")
-        print("- JIRA_USERNAME: Your Jira username/email")
-        print("- JIRA_API_TOKEN: Your Jira API token")
-        print("- JIRA_PROJECT_KEY: The project key to fetch (e.g., PROJ)")
+        print("- JIRA_API_TOKEN: Your Jira API token (uses bearer token authentication)")
+        print("- JIRA_PROJECT_KEY: The project key to fetch (e.g., PROJ) or use --project flag")
+        print("Note: JIRA_USERNAME is optional and not used with token authentication")
         sys.exit(1)
     
     # Initialize and run the converter
-    converter = JiraToSQLite(server_url, username, api_token)
-    success = converter.run(project_key)
+    converter = JiraToSQLite(server_url, username, api_token, args.db_path)
+    success = converter.run(project_key, args.limit)
     
     if success:
         print("Jira to SQLite conversion completed successfully!")
